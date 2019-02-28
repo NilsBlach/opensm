@@ -3,7 +3,7 @@
  * Copyright (c) 2002-2015 Mellanox Technologies LTD. All rights reserved.
  * Copyright (c) 1996-2003 Intel Corporation. All rights reserved.
  * Copyright (c) 2009-2015 ZIH, TU Dresden, Federal Republic of Germany. All rights reserved.
- * Copyright (C) 2012-2017 Tokyo Institute of Technology. All rights reserved.
+ * Copyright (C) 2012-2019 Tokyo Institute of Technology. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -56,9 +56,21 @@
 #include <opensm/osm_node.h>
 #include <opensm/osm_multicast.h>
 #include <opensm/osm_mcast_mgr.h>
+#if ENABLE_LIBCSV_FOR_PARX
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <ctype.h>
+#include <errno.h>
+#include <search.h>
+#include <csv.h>
+#endif
 
 /* "infinity" for dijkstra */
-#define INF      0x7FFFFFFF
+#define INF      0x7FEFEFEFEFEFEFE0
+
+#define PARX_COMM_DEMANDS_TYPE 0x42
 
 enum {
 	UNDISCOVERED = 0,
@@ -81,6 +93,21 @@ typedef struct link {
 	struct link *next;
 } link_t;
 
+typedef struct dst_demand {
+	ib_net16_t lid;
+	uint8_t demand;
+} dst_demand_t;
+
+typedef struct comm_demands {
+	uint8_t type;
+	osm_ucast_mgr_t *p_mgr;
+	osm_port_t *src_port;
+	size_t fields;
+	size_t max_fields;
+	dst_demand_t *demands;
+	uint16_t *num_job_ports;
+} comm_demands_t;
+
 typedef struct vertex {
 	/* informations of the fabric */
 	uint64_t guid;
@@ -97,6 +124,8 @@ typedef struct vertex {
 	/* for LFT writing and debug */
 	osm_switch_t *sw;	/* selfpointer */
 	boolean_t dropped;	/* indicate dropped switches (w/ ucast cache) */
+	/* array to store comm. demands of adj HCAs towards other nodes */
+	comm_demands_t demand_arr;
 } vertex_t;
 
 typedef struct vltable {
@@ -131,6 +160,8 @@ typedef struct dfsssp_context {
 	uint32_t adj_list_size;
 	vltable_t *srcdest2vl_table;
 	uint8_t *vl_split_count;
+	boolean_t do_pattern_aware_routing;
+	struct csv_parser *csv_p;
 } dfsssp_context_t;
 
 /**************** set initial values for structs **********************
@@ -159,6 +190,12 @@ static inline void set_default_vertex(vertex_t * vertex)
 	vertex->heap_index = 0;
 	vertex->sw = NULL;
 	vertex->dropped = FALSE;
+	vertex->demand_arr.type = PARX_COMM_DEMANDS_TYPE;
+	vertex->demand_arr.p_mgr = NULL;
+	vertex->demand_arr.src_port = NULL;
+	vertex->demand_arr.fields = 0;
+	vertex->demand_arr.max_fields = 0;
+	vertex->demand_arr.demands = NULL;
 }
 
 static inline void set_default_cdg_node(cdg_node_t * node)
@@ -906,7 +943,7 @@ static void add_sw_endports_to_order_list(osm_switch_t * sw,
 				cl_qlist_insert_tail(&m->port_order_list,
 						     &port->list_item);
 			else
-				OSM_LOG(m->p_log, OSM_LOG_INFO,
+				OSM_LOG(m->p_log, OSM_LOG_DEBUG,
 					"WRN AD37: guid 0x%016" PRIx64
 					" already in list\n", port_guid);
 		}
@@ -1070,6 +1107,15 @@ static int dfsssp_build_graph(void *context)
 	if (dfsssp_ctx->adj_list)
 		dfsssp_context_destroy(context);
 
+#if ENABLE_LIBCSV_FOR_PARX
+	dfsssp_ctx->do_pattern_aware_routing =
+		(p_mgr->p_subn->opt.comm_demand_collection_file) ? TRUE : FALSE;
+	if (dfsssp_ctx->routing_type == OSM_ROUTING_ENGINE_TYPE_PARX
+	    && !dfsssp_ctx->do_pattern_aware_routing)
+		OSM_LOG(p_mgr->p_log, OSM_LOG_INFO,
+			"PARX: no comm. demand matrix given; fallback to DFSSSP\n");
+#endif
+
 	/* construct the generic heap opject to use it in dijkstra */
 	cl_heap_construct(&heap);
 
@@ -1186,6 +1232,7 @@ static int dfsssp_build_graph(void *context)
 			link->from_port = port;
 			link->to_port = remote_port;
 			link->weight = total_num_hca * total_num_hca;	/* initialize with P^2 to force shortest paths */
+			link->weight *= (255 * 255);	/* increase to cover max. +255 from comm. demands per path */
 		}
 
 		adj_list[i].links = head->next;
@@ -1689,14 +1736,21 @@ static int update_mcft(osm_sm_t * p_sm, vertex_t * adj_list,
 	return 0;
 }
 
+static int cmp_demands_by_lid(const void *d1, const void *d2);
+
 /* increment the edge weights of the df-/sssp graph which represent the number
    of paths on this link
 */
 static void update_weights(osm_ucast_mgr_t * p_mgr, vertex_t * adj_list,
-			   uint32_t adj_list_size)
+			   uint32_t adj_list_size, osm_port_t *desti_port,
+			   boolean_t do_pattern_aware_routing)
 {
 	uint32_t i = 0, j = 0;
 	uint32_t additional_weight = 0;
+	comm_demands_t *p_sw_comm_demands = NULL;
+	dst_demand_t *p_demand = NULL;
+	dst_demand_t dst = {.lid = osm_port_get_base_lid(desti_port),
+			    .demand = 0};
 
 	OSM_LOG_ENTER(p_mgr->p_log);
 
@@ -1704,7 +1758,23 @@ static void update_weights(osm_ucast_mgr_t * p_mgr, vertex_t * adj_list,
 		/* if no route goes thru this switch -> cycle */
 		if (!(adj_list[i].used_link))
 			continue;
-		additional_weight = adj_list[i].num_hca;
+		if (!do_pattern_aware_routing) {
+			additional_weight = adj_list[i].num_hca;
+		} else {
+			p_sw_comm_demands = &(adj_list[i].demand_arr);
+			if (!p_sw_comm_demands || !p_sw_comm_demands->demands)
+				continue;
+
+			p_demand = bsearch(&dst, p_sw_comm_demands->demands,
+					   p_sw_comm_demands->fields,
+					   sizeof(dst_demand_t),
+					   cmp_demands_by_lid);
+
+			if (p_demand)
+				additional_weight = p_demand->demand;
+			else
+				continue;
+		}
 
 		j = i;
 		while (adj_list[j].used_link) {
@@ -2116,11 +2186,28 @@ static int dfsssp_remove_deadlocks(dfsssp_context_t * dfsssp_ctx)
 		}
 	} else if (vl_needed > vl_avail) {
 		/* routing not possible, a further development would be the LASH-TOR approach (update: LASH-TOR isn't possible, there is a mistake in the theory) */
+#if ENABLE_LIBCSV_FOR_PARX
+		if (dfsssp_ctx->routing_type == OSM_ROUTING_ENGINE_TYPE_PARX
+		    && dfsssp_ctx->do_pattern_aware_routing) {
+			// WRN: this is only precaution for our hyperx experiment because
+			// the fabric only has 4 VL and not 8 as usually and we accept
+			// the risk for now... just in case we really exceed with PARX
+			// (for dfsssp we only needed 3, so maybe we're good with parx)
+			OSM_LOG(p_mgr->p_log, OSM_LOG_INFO,
+				"WRN AD25: Not enough VLs available; but temporarily accept this risk for PARX!\n");
+		} else {
+			OSM_LOG(p_mgr->p_log, OSM_LOG_ERROR,
+				"ERR AD25: Not enough VLs available; Stopping routing!\n");
+			err = 1;
+			goto ERROR;
+		}
+#else
 		OSM_LOG(p_mgr->p_log, OSM_LOG_ERROR,
 			"ERR AD25: Not enough VLs available (avail=%d, needed=%d); Stopping dfsssp routing!\n",
 			vl_avail, vl_needed);
 		err = 1;
 		goto ERROR;
+#endif
 	}
 	/* else { no balancing } */
 
@@ -2168,6 +2255,403 @@ ERROR:
 	return err;
 }
 
+static int cmp_demands_by_lid(const void *d1, const void *d2)
+{
+	dst_demand_t *demand1 = (dst_demand_t *) d1;
+	dst_demand_t *demand2 = (dst_demand_t *) d2;
+
+	if (demand1->lid < demand2->lid)
+		return -1;
+	else if (demand1->lid > demand2->lid)
+		return 1;
+	else
+		return 0;
+}
+
+static osm_port_t *find_port_by_hostname(const osm_ucast_mgr_t *p_mgr,
+					 const char *hostname)
+{
+	cl_qmap_t *port_tbl = &p_mgr->p_subn->port_guid_tbl;
+	osm_port_t *port = NULL;
+	cl_map_item_t *item = NULL;
+
+	for (item = cl_qmap_head(port_tbl); item != cl_qmap_end(port_tbl);
+	     item = cl_qmap_next(item)) {
+		port = (osm_port_t *) item;
+		if (0 == strcmp(hostname, strtok(port->p_node->print_desc, " ")))
+			return port;
+	}
+
+	return NULL;
+}
+
+static void process_csv_field(void *str, size_t len, void *data)
+{
+	char hostname[UINT8_MAX];
+	comm_demands_t *p_comm_demands = NULL;
+	osm_port_t *port = NULL;
+	uint64_t num_destinations = 0, idx = 0, demand = 0;
+
+	if (!str || !data)
+		return;
+	p_comm_demands = (comm_demands_t *) data;
+
+	if (UINT16_MAX == p_comm_demands->fields)
+		return;
+	else
+		p_comm_demands->fields++;
+
+	/* ignore additional fields if user provided wrong information */
+	if (p_comm_demands->fields > p_comm_demands->max_fields)
+		return;
+
+	if (1 == p_comm_demands->fields && !p_comm_demands->src_port) {
+		/* first element is src host */
+		strcpy(hostname, str);
+
+		port = find_port_by_hostname(p_comm_demands->p_mgr, hostname);
+		if (!port ||
+		    osm_node_get_type(port->p_node) != IB_NODE_TYPE_CA) {
+			p_comm_demands->fields = UINT16_MAX;
+			return;
+		}
+		p_comm_demands->src_port = port;
+	} else if (2 == p_comm_demands->fields) {
+		/* second element is the number of destinations it sends to */
+		num_destinations = strtoull(str, NULL, 0);
+		if (!num_destinations)
+			return;
+
+		p_comm_demands->demands = malloc(num_destinations *
+						 sizeof(dst_demand_t));
+		if (!p_comm_demands->demands) {
+			p_comm_demands->fields = UINT16_MAX;
+			return;
+		} else {
+			p_comm_demands->max_fields = num_destinations * 2 + 2;
+		}
+	} else if (1 == p_comm_demands->fields % 2) {
+		/* odd fields carry the dst hostname */
+		strcpy(hostname, str);
+
+		port = find_port_by_hostname(p_comm_demands->p_mgr, hostname);
+		if (!port ||
+		    osm_node_get_type(port->p_node) != IB_NODE_TYPE_CA) {
+			p_comm_demands->fields = UINT16_MAX;
+			return;
+		}
+		idx = (p_comm_demands->fields - 1) / 2 - 1;
+		p_comm_demands->demands[idx].lid = osm_port_get_base_lid(port);
+	} else {
+		/* even fields carry the corresponding path weight */
+		demand = strtoull(str, NULL, 0);
+
+		if (demand > UINT8_MAX)
+			demand = UINT8_MAX;
+		idx = (p_comm_demands->fields - 1) / 2 - 1;
+		p_comm_demands->demands[idx].demand = demand;
+	}
+}
+
+static inline void set_default_comm_demands(osm_ucast_mgr_t *p_mgr,
+					    comm_demands_t *p_comm_demands,
+					    uint16_t *num_job_ports)
+{
+	p_comm_demands->type = PARX_COMM_DEMANDS_TYPE;
+	p_comm_demands->p_mgr = p_mgr;
+	p_comm_demands->src_port = NULL;
+	p_comm_demands->fields = 0;
+	p_comm_demands->max_fields = UINT16_MAX;
+	p_comm_demands->demands = NULL;
+	p_comm_demands->num_job_ports = num_job_ports;
+}
+
+static void process_end_of_record(int ignored, void *data)
+{
+	comm_demands_t *p_comm_demands = NULL, *p_priv_comm_demands = NULL;
+	osm_port_t *port = NULL;
+	dst_demand_t *dst_demand_arr = NULL;
+
+	if (!data)
+		return;
+	p_comm_demands = (comm_demands_t *) data;
+
+	if (UINT16_MAX == p_comm_demands->fields)
+		goto Exit;
+
+	p_comm_demands->fields = p_comm_demands->fields / 2 - 1;
+	p_comm_demands->max_fields = p_comm_demands->max_fields / 2 - 1;
+	port = p_comm_demands->src_port;
+
+	if (!port->priv) {
+		/* jobs have first-order balancing priority */
+		if (!cl_is_item_in_qlist(&p_comm_demands->p_mgr->port_order_list,
+					 &port->list_item)) {
+			cl_qlist_insert_tail(&p_comm_demands->p_mgr->port_order_list,
+					     &port->list_item);
+			*(p_comm_demands->num_job_ports) += 1;
+
+		}
+		port->priv = malloc(sizeof(comm_demands_t));
+		set_default_comm_demands(p_comm_demands->p_mgr,
+					 (comm_demands_t *) port->priv, NULL);
+	}
+
+	p_priv_comm_demands = (comm_demands_t *) port->priv;
+
+	dst_demand_arr = realloc(p_priv_comm_demands->demands,
+				 sizeof(dst_demand_t) *
+				 (p_priv_comm_demands->fields +
+				 p_comm_demands->fields));
+	if (!dst_demand_arr) {
+		OSM_LOG(p_comm_demands->p_mgr->p_log, OSM_LOG_ERROR,
+		"ERR AD55: guid 0x%016" PRIx64 " ran out of memory"
+		" and cannot store all destinations \n",
+		cl_ntoh64(osm_port_get_guid(port)));
+		return;
+	}
+
+	memcpy(&dst_demand_arr[p_priv_comm_demands->fields],
+	       p_comm_demands->demands,
+	       sizeof(dst_demand_t) * p_comm_demands->fields);
+
+	p_priv_comm_demands->demands = dst_demand_arr;
+	p_priv_comm_demands->fields += p_comm_demands->fields;
+	p_priv_comm_demands->max_fields = p_priv_comm_demands->fields;
+
+Exit:
+	if (p_comm_demands->demands)
+		free(p_comm_demands->demands);
+	set_default_comm_demands(p_comm_demands->p_mgr, p_comm_demands,
+				 p_comm_demands->num_job_ports);
+}
+
+static int parse_comm_demands(osm_ucast_mgr_t *p_mgr,
+			      dfsssp_context_t *dfsssp_ctx,
+			      const char *filename, uint16_t *num_job_ports)
+{
+	FILE *file = NULL;
+	char chunk[UINT8_MAX];
+	size_t bytes_read;
+	comm_demands_t *p_comm_demands = NULL;
+
+	if (!p_mgr || !dfsssp_ctx || dfsssp_ctx->csv_p || !filename)
+		return -1;
+
+	if (!(file = fopen(filename, "r")))
+		return -2;
+
+	/* try to aquire the file lock on the csv file */
+	while (0 != lockf(fileno(file), F_TEST, 0))
+		usleep(100000); /* 0.1s */
+
+	lockf(fileno(file), F_LOCK, 0);
+
+	if (!(dfsssp_ctx->csv_p = malloc(sizeof(struct csv_parser)))) {
+		return -3;
+	}
+
+	if (0 != csv_init(dfsssp_ctx->csv_p,
+			  CSV_STRICT | CSV_STRICT_FINI | CSV_APPEND_NULL |
+			  CSV_EMPTY_IS_NULL))
+		return -4;
+
+	p_comm_demands = malloc(sizeof(comm_demands_t));
+	set_default_comm_demands(p_mgr, p_comm_demands, num_job_ports);
+
+	while ((bytes_read = fread(chunk, 1, UINT8_MAX, file)) > 0)
+		if (bytes_read != csv_parse(dfsssp_ctx->csv_p, chunk,
+					    bytes_read,
+					    process_csv_field,
+					    process_end_of_record,
+					    p_comm_demands)) {
+			fprintf(stderr, "Error while parsing file: %s\n",
+					csv_strerror(csv_error(
+							dfsssp_ctx->csv_p)));
+			return -5;
+		}
+
+	csv_fini(dfsssp_ctx->csv_p, process_csv_field, process_end_of_record,
+		 p_comm_demands);
+	csv_free(dfsssp_ctx->csv_p);
+
+	free(dfsssp_ctx->csv_p);
+	dfsssp_ctx->csv_p = NULL;
+
+	if (p_comm_demands->demands)
+		free(p_comm_demands->demands);
+	free(p_comm_demands);
+	p_comm_demands = NULL;
+
+	lockf(fileno(file), F_ULOCK, 0);
+	fclose(file);
+
+	return 0;
+}
+
+static int add_job_demands_to_ports_priv(osm_ucast_mgr_t *p_mgr,
+					 dfsssp_context_t *dfsssp_ctx,
+					 uint16_t *num_job_ports)
+{
+	char line[UINT8_MAX];
+	char filename[UINT8_MAX];
+	uint8_t str_len = 0;
+	FILE *file = NULL;
+	char *p = NULL;
+	int ret = 0;
+
+	if (!p_mgr->p_subn->opt.comm_demand_collection_file)
+		return -1;
+
+	if (!(file = fopen(p_mgr->p_subn->opt.comm_demand_collection_file, "r")))
+		return -2;
+
+	/* try to aquire the file lock on the comm_demand_collection_file */
+	while (0 != lockf(fileno(file), F_TEST, 0))
+		usleep(100000);	/* 0.1s */
+
+	lockf(fileno(file), F_LOCK, 0);
+
+	while (fgets(line, sizeof(line), file)) {
+		p = line;
+		while (isspace(*p))
+			p++;
+
+		if (*p == '\0' || *p == '\n' || *p == '#')
+			continue;
+
+		str_len = 0;
+		while (!isspace(*p)) {
+			if (*p == '\0' || *p == '\n' || *p == '#' ||
+			    str_len == UINT8_MAX) {
+				errno = EINVAL;
+				ret = -3;
+				goto Exit;
+			}
+			filename[str_len++] = *p;
+			p++;
+		}
+		filename[str_len++] = '\0';
+
+		if ((ret = parse_comm_demands(p_mgr, dfsssp_ctx, filename,
+					      num_job_ports))) {
+			errno = EIO;
+			goto Exit;
+		}
+	}
+
+Exit:
+	lockf(fileno(file), F_ULOCK, 0);
+	fclose(file);
+
+	return ret;
+}
+
+static void free_ports_priv(const osm_ucast_mgr_t * p_mgr)
+{
+	cl_qmap_t *port_tbl = NULL;
+	osm_port_t *port = NULL;
+	cl_map_item_t *item = NULL;
+	comm_demands_t *p_comm_demands = NULL;
+
+	if (!p_mgr)
+		return;
+
+	port_tbl = &p_mgr->p_subn->port_guid_tbl;
+	for (item = cl_qmap_head(port_tbl); item != cl_qmap_end(port_tbl);
+	     item = cl_qmap_next(item)) {
+		port = (osm_port_t *) item;
+		if (port->priv) {
+			p_comm_demands = (comm_demands_t *) port->priv;
+			if (PARX_COMM_DEMANDS_TYPE == p_comm_demands->type)
+				if (p_comm_demands->demands)
+					free(p_comm_demands->demands);
+			free(port->priv);
+			port->priv = NULL;
+		}
+	}
+}
+
+static int merge_demands_into_switches(const osm_ucast_mgr_t *p_mgr,
+				       const dfsssp_context_t *dfsssp_ctx)
+{
+	cl_qmap_t *port_tbl = &p_mgr->p_subn->port_guid_tbl;
+	vertex_t *adj_list = dfsssp_ctx->adj_list;
+	uint32_t i = 0, adj_list_size = dfsssp_ctx->adj_list_size;
+	osm_port_t *port = NULL;
+	cl_map_item_t *item = NULL;
+	osm_node_t *remote_node = NULL;
+	uint8_t remote_port = 0, j = 0;
+	uint64_t guid = 0;
+	comm_demands_t *p_comm_demands = NULL, *p_sw_comm_demands = NULL;
+	dst_demand_t *p_demand = NULL, *p_demands = NULL;
+	size_t new_size = 0;
+
+	for (item = cl_qmap_head(port_tbl); item != cl_qmap_end(port_tbl);
+	     item = cl_qmap_next(item)) {
+		port = (osm_port_t *) item;
+
+		if (!port->priv)
+			continue;
+
+		p_comm_demands = (comm_demands_t *) port->priv;
+		if (UINT16_MAX == p_comm_demands->fields ||
+		    0 == p_comm_demands->fields)
+			continue;
+
+		remote_node =
+		    osm_node_get_remote_node(port->p_node,
+					     port->p_physp->port_num,
+					     &remote_port);
+		if (!remote_node ||
+		    osm_node_get_type(remote_node) != IB_NODE_TYPE_SWITCH)
+			continue;
+
+		guid = cl_ntoh64(osm_node_get_node_guid(remote_node));
+		for (i = 1; i < adj_list_size; i++) {
+			if (guid != adj_list[i].guid)
+				continue;
+
+			p_sw_comm_demands = &(adj_list[i].demand_arr);
+			new_size = p_sw_comm_demands->fields +
+				p_comm_demands->fields;
+
+			p_demands = realloc(p_sw_comm_demands->demands,
+					    new_size * sizeof(dst_demand_t));
+			if (p_demands) {
+				p_sw_comm_demands->demands = p_demands;
+				p_sw_comm_demands->max_fields = new_size;
+			} else
+				return -1;
+
+			for (j = 0; j < p_comm_demands->fields; j++) {
+				p_demand = lfind(&(p_comm_demands->demands[j]),
+						 p_sw_comm_demands->demands,
+						 &(p_sw_comm_demands->fields),
+						 sizeof(dst_demand_t),
+						 cmp_demands_by_lid);
+				if (p_demand) {
+					p_demand->demand +=
+						p_comm_demands->demands[j].demand;
+				} else {
+					p_sw_comm_demands->demands[p_sw_comm_demands->fields] =
+						p_comm_demands->demands[j];
+					p_sw_comm_demands->fields++;
+				}
+			}
+		}
+	}
+
+	for (i = 1; i < adj_list_size; i++) {
+		if (adj_list[i].demand_arr.fields)
+			qsort(adj_list[i].demand_arr.demands,
+			      adj_list[i].demand_arr.fields,
+			      sizeof(dst_demand_t), cmp_demands_by_lid);
+	}
+
+	return 0;
+}
+
 /* meta function which calls subfunctions for dijkstra, update lft and weights,
    (and remove deadlocks) to calculate the routing for the subnet
 */
@@ -2192,15 +2676,17 @@ static int dfsssp_do_dijkstra_routing(void *context)
 	osm_port_t *port = NULL;
 	uint32_t i = 0, err = 0;
 	uint16_t lid = 0, min_lid_ho = 0, max_lid_ho = 0;
+	uint16_t processed_ports = 0, num_job_ports = 0;
 	uint8_t lmc = 0;
 	boolean_t cn_nodes_provided = FALSE, io_nodes_provided = FALSE;
+	int ret = 0;
 
 	OSM_LOG_ENTER(p_mgr->p_log);
 	OSM_LOG(p_mgr->p_log, OSM_LOG_VERBOSE,
 		"Calculating shortest path from all Hca/switches to all\n");
 
-	cl_qmap_init(&cn_tbl);
-	cl_qmap_init(&io_tbl);
+	cl_qmap_init(&cn_tbl); /* 'normal' compute nodes */
+	cl_qmap_init(&io_tbl); /* and I/O nodes */
 	p_mixed_tbl = &cn_tbl;
 
 	cl_qlist_init(&p_mgr->port_order_list);
@@ -2243,6 +2729,42 @@ static int dfsssp_do_dijkstra_routing(void *context)
 
 	/* sort the sw_list in descending order */
 	sw_list_sort_by_num_hca(sw_list, sw_list_size);
+
+	/* parse comm. file, if provided by the batch system and add these nodes
+	   already to the port_order_list to improve the job-internal balancing,
+	   i.e., in theory more bisecion bandwidth within each job, but more
+	   inter-job overlap which is only problematic if they want to
+	   communicate at the exact same time (which is very unlikely), which is
+	   then tackled by the pattern-awareness part to minimize overlap again
+	 */
+	if (dfsssp_ctx->do_pattern_aware_routing) {
+		/* port->priv should be NULL, but let's be sure it actually is */
+		free_ports_priv(p_mgr);
+
+		num_job_ports = 0;
+		if ((ret = add_job_demands_to_ports_priv(p_mgr, dfsssp_ctx,
+							 &num_job_ports))) {
+			OSM_LOG(p_mgr->p_log, OSM_LOG_INFO,
+				"WRN AD12: Problem parsing comm. demand"
+				" collection file (ret = %d)\n", ret);
+			dfsssp_ctx->do_pattern_aware_routing = FALSE;
+		} else if (merge_demands_into_switches(p_mgr, dfsssp_ctx)) {
+			OSM_LOG(p_mgr->p_log, OSM_LOG_INFO,
+				"WRN AD12: Merging jobs into switch failed\n");
+			dfsssp_ctx->do_pattern_aware_routing = FALSE;
+		}
+
+		/* clean up if error encountered while checking job files */
+		if (!dfsssp_ctx->do_pattern_aware_routing) {
+			free_ports_priv(p_mgr);
+			if (!cl_is_qlist_empty(&p_mgr->port_order_list))
+				cl_qlist_remove_all(&p_mgr->port_order_list);
+		}
+
+		OSM_LOG(p_mgr->p_log, OSM_LOG_INFO,
+			"Added %" PRIu16 " ports for pattern-aware routing\n",
+			num_job_ports);
+	}
 
 	/* parse compute node guid file, if provided by the user */
 	if (p_mgr->p_subn->opt.cn_guid_file) {
@@ -2297,7 +2819,7 @@ static int dfsssp_do_dijkstra_routing(void *context)
 							      &cn_tbl, TRUE);
 			} else {
 				OSM_LOG(p_mgr->p_log, OSM_LOG_ERROR,
-					"ERR AD30: corrupted sw_list array in dfsssp_do_dijkstra_routing\n");
+					"ERR AD30: corrupted sw_list array\n");
 				goto ERROR;
 			}
 		}
@@ -2313,14 +2835,16 @@ static int dfsssp_do_dijkstra_routing(void *context)
 							      &io_tbl, TRUE);
 			} else {
 				OSM_LOG(p_mgr->p_log, OSM_LOG_ERROR,
-					"ERR AD32: corrupted sw_list array in dfsssp_do_dijkstra_routing\n");
+					"ERR AD32: corrupted sw_list array\n");
 				goto ERROR;
 			}
 		}
 	}
-	/* then: add anything else, such as administration nodes, ... */
+	/* now merge all the port guid tables into p_mixed_tbl and
+	   afterwards add anything else, such as administration nodes, ...
+	 */
 	if (cn_nodes_provided && io_nodes_provided) {
-		cl_qmap_merge(&cn_tbl, &io_tbl);
+		cl_qmap_merge(p_mixed_tbl, &io_tbl);
 	} else if (io_nodes_provided) {
 		p_mixed_tbl = &io_tbl;
 	}
@@ -2331,7 +2855,7 @@ static int dfsssp_do_dijkstra_routing(void *context)
 						      FALSE);
 		} else {
 			OSM_LOG(p_mgr->p_log, OSM_LOG_ERROR,
-				"ERR AD39: corrupted sw_list array in dfsssp_do_dijkstra_routing\n");
+				"ERR AD39: corrupted sw_list array\n");
 			goto ERROR;
 		}
 	}
@@ -2343,7 +2867,7 @@ static int dfsssp_do_dijkstra_routing(void *context)
 			add_guid_to_order_list(guid, p_mgr);
 		} else {
 			OSM_LOG(p_mgr->p_log, OSM_LOG_ERROR,
-				"ERR AD31: corrupted sw_list array in dfsssp_do_dijkstra_routing\n");
+				"ERR AD31: corrupted sw_list array\n");
 			goto ERROR;
 		}
 	}
@@ -2361,10 +2885,12 @@ static int dfsssp_do_dijkstra_routing(void *context)
 	   in the subnet (to add the routes to base/enhanced SP0)
 	 */
 	qlist = &p_mgr->port_order_list;
+	processed_ports = 0;
 	for (qlist_item = cl_qlist_head(qlist);
 	     qlist_item != cl_qlist_end(qlist);
 	     qlist_item = cl_qlist_next(qlist_item)) {
 		port = (osm_port_t *)cl_item_obj(qlist_item, port, list_item);
+		processed_ports++;
 
 		/* calculate shortest path with dijkstra from node to all switches/Hca */
 		if (osm_node_get_type(port->p_node) == IB_NODE_TYPE_CA) {
@@ -2405,8 +2931,16 @@ static int dfsssp_do_dijkstra_routing(void *context)
 			if (err)
 				goto ERROR;
 
-			/* add weights for calculated routes to adjust the weights for the next cycle */
-			update_weights(p_mgr, adj_list, adj_list_size);
+			/* add weights for calculated routes to adjust the
+			   weights for the next cycle
+			 */
+			if (processed_ports > num_job_ports) {
+				update_weights(p_mgr, adj_list, adj_list_size,
+					       port, FALSE);
+			} else {
+				update_weights(p_mgr, adj_list, adj_list_size, port,
+					       dfsssp_ctx->do_pattern_aware_routing);
+			}
 
 			if (OSM_LOG_IS_ACTIVE_V2(p_mgr->p_log, OSM_LOG_DEBUG))
 				dfsssp_print_graph(p_mgr, adj_list,
@@ -2414,15 +2948,20 @@ static int dfsssp_do_dijkstra_routing(void *context)
 		}
 	}
 
-	/* try deadlock removal only for the dfsssp routing (not for the sssp case, which is a subset of the dfsssp algorithm) */
-	if (dfsssp_ctx->routing_type == OSM_ROUTING_ENGINE_TYPE_DFSSSP) {
-		/* remove potential deadlocks by assigning different virtual lanes to src/dest paths and balance the lanes */
+	/* try deadlock removal only for the dfsssp routing (not for the sssp
+	   case, which is a subset of the dfsssp algorithm)
+	 */
+	if (dfsssp_ctx->routing_type == OSM_ROUTING_ENGINE_TYPE_DFSSSP
+	    || dfsssp_ctx->routing_type == OSM_ROUTING_ENGINE_TYPE_PARX) {
+		/* remove potential deadlocks by assigning different virtual
+		   lanes to src/dest paths and balance the lanes
+		 */
 		err = dfsssp_remove_deadlocks(dfsssp_ctx);
 		if (err)
 			goto ERROR;
 	} else if (dfsssp_ctx->routing_type == OSM_ROUTING_ENGINE_TYPE_SSSP) {
 		OSM_LOG(p_mgr->p_log, OSM_LOG_INFO,
-			"SSSP routing specified -> skipping deadlock removal thru dfsssp_remove_deadlocks(...)\n");
+			"SSSP routing specified -> skipping deadlock removal\n");
 	} else {
 		OSM_LOG(p_mgr->p_log, OSM_LOG_ERROR,
 			"ERR AD28: wrong routing engine specified in dfsssp_ctx\n");
@@ -2455,10 +2994,12 @@ static int dfsssp_do_dijkstra_routing(void *context)
 		}
 	}
 
+	free_ports_priv(p_mgr);
 	OSM_LOG_EXIT(p_mgr->p_log);
 	return 0;
 
 ERROR:
+	free_ports_priv(p_mgr);
 	if (!cl_is_qlist_empty(&p_mgr->port_order_list))
 		cl_qlist_remove_all(&p_mgr->port_order_list);
 	if (cn_nodes_provided)
@@ -2634,7 +3175,8 @@ static uint8_t get_dfsssp_sl(void *context, uint8_t hint_for_default_sl,
 	int32_t res = 0;
 
 	if (dfsssp_ctx
-	    && dfsssp_ctx->routing_type == OSM_ROUTING_ENGINE_TYPE_DFSSSP) {
+	    && (dfsssp_ctx->routing_type == OSM_ROUTING_ENGINE_TYPE_DFSSSP
+	    || dfsssp_ctx->routing_type == OSM_ROUTING_ENGINE_TYPE_PARX)) {
 		p_mgr = (osm_ucast_mgr_t *) dfsssp_ctx->p_mgr;
 		srcdest2vl_table = (vltable_t *) (dfsssp_ctx->srcdest2vl_table);
 		vl_split_count = (uint8_t *) (dfsssp_ctx->vl_split_count);
@@ -2684,6 +3226,8 @@ static dfsssp_context_t *dfsssp_context_create(osm_opensm_t * p_osm,
 		dfsssp_ctx->adj_list_size = 0;
 		dfsssp_ctx->srcdest2vl_table = NULL;
 		dfsssp_ctx->vl_split_count = NULL;
+		dfsssp_ctx->do_pattern_aware_routing = FALSE;
+		dfsssp_ctx->csv_p = NULL;
 	} else {
 		OSM_LOG(p_osm->sm.ucast_mgr.p_log, OSM_LOG_ERROR,
 			"ERR AD04: cannot allocate memory for dfsssp_ctx in dfsssp_context_create\n");
@@ -2723,6 +3267,15 @@ static void dfsssp_context_destroy(void *context)
 	if (dfsssp_ctx->vl_split_count) {
 		free(dfsssp_ctx->vl_split_count);
 		dfsssp_ctx->vl_split_count = NULL;
+	}
+
+	if (dfsssp_ctx->do_pattern_aware_routing)
+		free_ports_priv(dfsssp_ctx->p_mgr);
+	dfsssp_ctx->do_pattern_aware_routing = FALSE;
+	if (dfsssp_ctx->csv_p) {
+		csv_free(dfsssp_ctx->csv_p);
+		free(dfsssp_ctx->csv_p);
+		dfsssp_ctx->csv_p = NULL;
 	}
 }
 
@@ -2775,6 +3328,16 @@ int osm_ucast_sssp_setup(struct osm_routing_engine *r, osm_opensm_t * p_osm)
 	r->ucast_build_fwd_tables = dfsssp_do_dijkstra_routing;
 	r->mcast_build_stree = dfsssp_do_mcast_routing;
 	r->destroy = delete;
+
+	return 0;
+}
+
+int osm_ucast_parx_setup(struct osm_routing_engine *r, osm_opensm_t * p_osm)
+{
+	if (osm_ucast_dfsssp_setup(r, p_osm))
+		return 1;
+	dfsssp_context_t *dfsssp_ctx = (dfsssp_context_t *)r->context;
+	dfsssp_ctx->routing_type = OSM_ROUTING_ENGINE_TYPE_PARX;
 
 	return 0;
 }

@@ -80,6 +80,9 @@ extern int osm_ucast_torus2QoS_setup(struct osm_routing_engine *, osm_opensm_t *
 extern int osm_ucast_nue_setup(struct osm_routing_engine *, osm_opensm_t *);
 extern int osm_ucast_sssp_setup(struct osm_routing_engine *, osm_opensm_t *);
 extern int osm_ucast_dfsssp_setup(struct osm_routing_engine *, osm_opensm_t *);
+#if ENABLE_LIBCSV_FOR_PARX
+extern int osm_ucast_parx_setup(struct osm_routing_engine *, osm_opensm_t *);
+#endif
 
 const static struct routing_engine_module routing_modules[] = {
 	{"minhop", osm_ucast_minhop_setup},
@@ -93,6 +96,9 @@ const static struct routing_engine_module routing_modules[] = {
 	{"nue", osm_ucast_nue_setup},
 	{"dfsssp", osm_ucast_dfsssp_setup},
 	{"sssp", osm_ucast_sssp_setup},
+#if ENABLE_LIBCSV_FOR_PARX
+	{"parx", osm_ucast_parx_setup},
+#endif
 	{NULL, NULL}
 };
 
@@ -123,6 +129,10 @@ const char *osm_routing_engine_type_str(IN osm_routing_engine_type_t type)
 		return "dfsssp";
 	case OSM_ROUTING_ENGINE_TYPE_SSSP:
 		return "sssp";
+#if ENABLE_LIBCSV_FOR_PARX
+	case OSM_ROUTING_ENGINE_TYPE_PARX:
+		return "parx";
+#endif
 	default:
 		break;
 	}
@@ -159,6 +169,10 @@ osm_routing_engine_type_t osm_routing_engine_type(IN const char *str)
 		return OSM_ROUTING_ENGINE_TYPE_SSSP;
 	else if (!strcasecmp(str, "dfsssp"))
 		return OSM_ROUTING_ENGINE_TYPE_DFSSSP;
+#if ENABLE_LIBCSV_FOR_PARX
+	else if (!strcasecmp(str, "parx"))
+		return OSM_ROUTING_ENGINE_TYPE_PARX;
+#endif
 	else
 		return OSM_ROUTING_ENGINE_TYPE_UNKNOWN;
 }

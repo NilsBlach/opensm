@@ -113,6 +113,7 @@ typedef enum _osm_routing_engine_type {
 	OSM_ROUTING_ENGINE_TYPE_NUE,
 	OSM_ROUTING_ENGINE_TYPE_SSSP,
 	OSM_ROUTING_ENGINE_TYPE_DFSSSP,
+	OSM_ROUTING_ENGINE_TYPE_PARX,
 	OSM_ROUTING_ENGINE_TYPE_UNKNOWN
 } osm_routing_engine_type_t;
 /***********/

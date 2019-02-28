@@ -287,6 +287,13 @@ dnl Checks for headers and libraries
 METIS_CHECK_HEADER
 METIS_CHECK_LIB
 
+dnl Provide user option to enable libcsv support for parx routing
+LIBCSV_SEL
+
+dnl Checks for libcsv headers and libraries
+LIBCSV_CHECK_HEADER
+LIBCSV_CHECK_LIB
+
 AC_CONFIG_FILES([man/opensm.8 man/torus-2QoS.8 man/torus-2QoS.conf.5 scripts/opensm.init scripts/redhat-opensm.init scripts/sldd.sh])
 
 dnl Create the following Makefiles

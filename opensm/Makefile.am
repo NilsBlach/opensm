@@ -1,5 +1,5 @@
 
-AM_CPPFLAGS = $(OSMV_INCLUDES) $(METIS_INCLUDES)
+AM_CPPFLAGS = $(OSMV_INCLUDES) $(METIS_INCLUDES) $(LIBCSV_INCLUDES)
 
 AM_CFLAGS = -Wall -Wwrite-strings $(DBGFLAGS) -D_XOPEN_SOURCE=600 -D_GNU_SOURCE=1
 
@@ -64,7 +64,7 @@ AM_YFLAGS:= -d
 
 # we need to be able to load libraries from local build subtree before make install
 # we always give precedence to local tree libs and then use the pre-installed ones.
-opensm_LDADD = -L../complib -losmcomp -L../libvendor -losmvendor -L. -lopensm $(OSMV_LDADD) $(METIS_LDADD)
+opensm_LDADD = -L../complib -losmcomp -L../libvendor -losmvendor -L. -lopensm $(OSMV_LDADD) $(METIS_LDADD) $(LIBCSV_LDADD)
 
 opensmincludedir = $(includedir)/infiniband/opensm
 

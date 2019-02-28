@@ -69,6 +69,7 @@ volatile unsigned int osm_exit_flag = 0;
 
 static volatile unsigned int osm_hup_flag = 0;
 static volatile unsigned int osm_usr1_flag = 0;
+static volatile unsigned int osm_usr2_flag = 0;
 static char *pidfile;
 
 #define MAX_LOCAL_IBPORTS 64
@@ -91,6 +92,11 @@ static void mark_usr1_flag(int signum)
 	osm_usr1_flag = 1;
 }
 
+static void mark_usr2_flag(int signum)
+{
+	osm_usr2_flag = 1;
+}
+
 static sigset_t saved_sigset;
 
 static void block_signals()
@@ -101,6 +107,7 @@ static void block_signals()
 	sigaddset(&set, SIGINT);
 	sigaddset(&set, SIGTERM);
 	sigaddset(&set, SIGHUP);
+	sigaddset(&set, SIGUSR2);
 #ifndef HAVE_OLD_LINUX_THREADS
 	sigaddset(&set, SIGUSR1);
 #endif
@@ -119,6 +126,8 @@ static void setup_signals()
 	act.sa_handler = mark_hup_flag;
 	sigaction(SIGHUP, &act, NULL);
 	sigaction(SIGCONT, &act, NULL);
+	act.sa_handler = mark_usr2_flag;
+	sigaction(SIGUSR2, &act, NULL);
 #ifndef HAVE_OLD_LINUX_THREADS
 	act.sa_handler = mark_usr1_flag;
 	sigaction(SIGUSR1, &act, NULL);
@@ -183,7 +192,15 @@ static void show_usage(void)
 	       "          attempt to route with Min Hop unless 'no_fallback' is\n"
 	       "          included in the list of routing engines.\n"
 	       "          Supported engines: updn, dnup, file, ftree, lash, dor,\n"
+#if ENABLE_LIBCSV_FOR_PARX
+	       "                             torus-2QoS, nue, dfsssp, sssp, parx\n\n");
+	printf("--comm_demand_collection_file <file name>\n"
+	       "          This option specifies the name of a file given by the admin or\n"
+	       "          batch system containing file name(s) of communication demands\n"
+	       "          of job(s) using the fabric (currently only supported by PARX).\n\n");
+#else
 	       "                             torus-2QoS, nue, dfsssp, sssp\n\n");
+#endif
 	printf("--do_mesh_analysis\n"
 	       "          This option enables additional analysis for the lash\n"
 	       "          routing engine to precondition switch port assignments\n"
@@ -599,6 +616,12 @@ int osm_manager_loop(osm_subn_opt_t * p_opt, osm_opensm_t * p_osm)
 			p_osm->subn.force_heavy_sweep = TRUE;
 			osm_opensm_sweep(p_osm);
 		}
+		if (osm_usr2_flag) {
+			osm_usr2_flag = 0;
+			/* force a rerouting for parx */
+			p_osm->subn.force_reroute = TRUE;
+			osm_opensm_sweep(p_osm);
+		}
 	}
 	if (is_console_enabled(p_opt))
 		osm_console_exit(&p_osm->console, &p_osm->log);
@@ -702,6 +725,9 @@ int main(int argc, char *argv[])
 		{"torus_config", 1, NULL, 10},
 		{"guid_routing_order_no_scatter", 0, NULL, 13},
 		{"nue_max_num_vls", 1, NULL, 15},
+#if ENABLE_LIBCSV_FOR_PARX
+		{"comm_demand_collection_file", 1, NULL, 16},
+#endif
 		{NULL, 0, NULL, 0}	/* Required at the end of the array */
 	};
 
@@ -1162,6 +1188,13 @@ int main(int argc, char *argv[])
 			opt.nue_max_num_vls = (uint8_t) temp;
 			printf(" Nue maximum #VLs = %d\n", opt.nue_max_num_vls);
 			break;
+#if ENABLE_LIBCSV_FOR_PARX
+		case 16:
+			SET_STR_OPT(opt.comm_demand_collection_file , optarg);
+			printf(" Communication Demands File: %s\n",
+			       opt.comm_demand_collection_file);
+			break;
+#endif
 		case 'h':
 		case '?':
 		case ':':

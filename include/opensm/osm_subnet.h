@@ -312,6 +312,9 @@ typedef struct osm_subn_opt {
 	boolean_t sweep_on_trap;
 	char *routing_engine_names;
 	boolean_t avoid_throttled_links;
+#if ENABLE_LIBCSV_FOR_PARX
+	char *comm_demand_collection_file;
+#endif
 	boolean_t use_ucast_cache;
 	boolean_t connect_roots;
 	char *lid_matrix_dump_file;
@@ -551,6 +554,11 @@ typedef struct osm_subn_opt {
 *		in the fabric are treated as 'broken' by the routing engines
 *		(if they support it), and hence no path is assigned to these
 *		underperforming links and a warning is logged instead.
+*
+*	comm_demand_collection_file
+*               This option specifies the name of a file given by the admin or
+*               batch system containing file name(s) of communication demands
+*               of job(s) using the fabric (currently only supported by PARX).
 *
 *	connect_roots
 *		The option which will enforce root to root connectivity with

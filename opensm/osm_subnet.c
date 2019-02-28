@@ -810,6 +810,9 @@ static const opt_rec_t opt_tbl[] = {
 	{ "sweep_on_trap", OPT_OFFSET(sweep_on_trap), opts_parse_boolean, NULL, 1 },
 	{ "routing_engine", OPT_OFFSET(routing_engine_names), opts_parse_charp, NULL, 0 },
 	{ "avoid_throttled_links", OPT_OFFSET(avoid_throttled_links), opts_parse_boolean, NULL, 0 },
+#if ENABLE_LIBCSV_FOR_PARX
+	{ "comm_demand_collection_file", OPT_OFFSET(comm_demand_collection_file), opts_parse_charp, NULL, 0 },
+#endif
 	{ "connect_roots", OPT_OFFSET(connect_roots), opts_parse_boolean, NULL, 1 },
 	{ "use_ucast_cache", OPT_OFFSET(use_ucast_cache), opts_parse_boolean, NULL, 0 },
 	{ "log_file", OPT_OFFSET(log_file), opts_parse_charp, NULL, 0 },
@@ -1096,6 +1099,9 @@ static void subn_opt_destroy(IN osm_subn_opt_t * p_opt)
 	free(p_opt->hop_weights_file);
 	free(p_opt->port_search_ordering_file);
 	free(p_opt->routing_engine_names);
+#if ENABLE_LIBCSV_FOR_PARX
+	free(p_opt->comm_demand_collection_file);
+#endif
 	free(p_opt->log_file);
 	free(p_opt->partition_config_file);
 	free(p_opt->qos_policy_file);
@@ -1644,6 +1650,9 @@ void osm_subn_set_default_opt(IN osm_subn_opt_t * p_opt)
 	p_opt->use_ucast_cache = FALSE;
 	p_opt->routing_engine_names = NULL;
 	p_opt->avoid_throttled_links = FALSE;
+#if ENABLE_LIBCSV_FOR_PARX
+	p_opt->comm_demand_collection_file = NULL;
+#endif
 	p_opt->connect_roots = FALSE;
 	p_opt->lid_matrix_dump_file = NULL;
 	p_opt->lfts_file = NULL;
@@ -2581,15 +2590,35 @@ void osm_subn_output_conf(FILE *out, IN osm_subn_opt_t * p_opts)
 		"# commas so that specific ordering of routing algorithms will\n"
 		"# be tried if earlier routing engines fail.\n"
 		"# Supported engines: minhop, updn, dnup, file, ftree, lash,\n"
+#if ENABLE_LIBCSV_FOR_PARX
+		"#    dor, torus-2QoS, nue, dfsssp, sssp, parx\n"
+#else
 		"#    dor, torus-2QoS, nue, dfsssp, sssp\n"
+#endif
 		"routing_engine %s\n\n", p_opts->routing_engine_names ?
 		p_opts->routing_engine_names : null_str);
 
 	fprintf(out,
 		"# Routing engines will avoid throttled switch-to-switch links\n"
+#if ENABLE_LIBCSV_FOR_PARX
+		"# (supported by: nue, dfsssp, sssp, parx; use FALSE if unsure)\n"
+#else
 		"# (supported by: nue, dfsssp, sssp; use FALSE if unsure)\n"
+#endif
 		"avoid_throttled_links %s\n\n",
 		p_opts->avoid_throttled_links ? "TRUE" : "FALSE");
+
+#if ENABLE_LIBCSV_FOR_PARX
+	fprintf(out,
+		"# The file holds a list of file name(s) which each define a\n"
+		"# matrix of communication demands for an individual job.\n"
+		"# The routing engine can use this information,  given by an\n"
+		"# admin or the batch system, to optimize for comm-aware paths.\n"
+		"# The feature is currently only supported by PARX routing.\n"
+		"comm_demand_collection_file %s\n\n",
+		p_opts->comm_demand_collection_file ?
+		p_opts->comm_demand_collection_file : null_str);
+#endif
 
 	fprintf(out,
 		"# Connect roots (use FALSE if unsure)\n"

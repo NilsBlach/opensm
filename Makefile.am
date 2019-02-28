@@ -10,6 +10,8 @@ install-exec-hook:
 	$(top_srcdir)/config/install-sh -m 755 -d $(DESTDIR)/$(sysconfdir)/init.d
 	cp $(top_builddir)/scripts/opensm.init $(DESTDIR)/$(sysconfdir)/init.d/opensmd
 	chmod 755 $(DESTDIR)/$(sysconfdir)/init.d/opensmd
+	cp $(top_srcdir)/scripts/CommDemands2OSM.py $(sbindir)/CommDemands2OSM.py
+	chmod 755 $(sbindir)/CommDemands2OSM.py
 
 
 man_MANS = man/opensm.8 man/osmtest.8 man/torus-2QoS.8 man/torus-2QoS.conf.5
