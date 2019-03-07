@@ -162,6 +162,7 @@ typedef struct dfsssp_context {
 	uint8_t *vl_split_count;
 	boolean_t do_pattern_aware_routing;
 	struct csv_parser *csv_p;
+	uint8_t max_lmc;
 } dfsssp_context_t;
 
 /**************** set initial values for structs **********************
@@ -1072,7 +1073,7 @@ static void dfsssp_print_graph(osm_ucast_mgr_t * p_mgr, vertex_t * adj_list,
 static void dfsssp_context_destroy(void *context);
 static int dijkstra(osm_ucast_mgr_t * p_mgr, cl_heap_t * p_heap,
 		    vertex_t * adj_list, uint32_t adj_list_size,
-		    osm_port_t * port, uint16_t lid);
+		    osm_port_t * port, uint16_t lid, int8_t lid_offset);
 
 /* traverse subnet to gather information about the connected switches */
 static int dfsssp_build_graph(void *context)
@@ -1144,6 +1145,8 @@ static int dfsssp_build_graph(void *context)
 		    osm_node_get_type(p_port->p_node) == IB_NODE_TYPE_SWITCH) {
 			lmc = osm_port_get_lmc(p_port);
 			total_num_hca += (1 << lmc);
+			if (lmc > dfsssp_ctx->max_lmc)
+				dfsssp_ctx->max_lmc = lmc;
 		}
 	}
 
@@ -1255,7 +1258,8 @@ static int dfsssp_build_graph(void *context)
 	/* do one dry run to determine connectivity issues */
 	sm_lid = p_mgr->p_subn->master_sm_base_lid;
 	p_port = osm_get_port_by_lid(p_mgr->p_subn, sm_lid);
-	err = dijkstra(p_mgr, &heap, adj_list, adj_list_size, p_port, sm_lid);
+	err = dijkstra(p_mgr, &heap, adj_list, adj_list_size, p_port, sm_lid,
+		       -1);
 	if (err) {
 		goto ERROR;
 	} else {
@@ -1336,10 +1340,67 @@ static void apply_index_update(const void * context, const size_t new_index)
 		heap_elem->heap_index = new_index;
 }
 
+/* determine quadrant based on lid */
+static inline uint8_t get_quadrant_of_lid(uint16_t lid)
+{
+	/* switch lids have a 10k offset for parx */
+	lid = lid % 10000;
+	/* imply /1000 to get quadrant, since Q0 is 0-999, Q1 is 1k.2k, etc */
+	return lid / 1000;
+}
+
+/* check if we have to exclude a link for parx */
+static inline boolean_t valid_link_4_parx(vertex_t * adj_list,
+					  link_t * link, int8_t lid_offset)
+{
+	uint8_t from_Q = 0, to_Q = 0;
+
+	/* -1 as input for multicast and non-parx => default: use all links */
+	if (lid_offset < 0)
+		return TRUE;
+
+	/* layout of the 8x12 hyperx and its 4 quadrants
+           ---------------------------------------------------------------
+           | r10:sw1 r12:sw1 r20:sw1 ... r32:sw1 | r40:sw1  ...  r62:sw1 |
+           | r10:sw2 r12:sw2                :    |                       |
+           | r10:sw3            Q0               |           Q3          |
+           | r10:sw4 r12:sw4     ...     r32:sw4 |                       |
+           --------------------------------------------------------------|
+           | r11:sw1                             |                       |
+           | r11:sw2   :        Q1               |           Q2          |
+           | r11:sw3                             |                       |
+           | r11:sw4 r13:sw4                            ...      r63:sw4 |
+           ---------------------------------------------------------------
+
+	   lid_offset = 0: no direct links in left half of HX (meaning Q0/Q1)
+	   lid_offset = 1: no direct links in right half (Q2/Q3)
+	   lid_offset = 2: no direct links in top half (Q0/Q3)
+	   lid_offset = 3: no direct links in bottom half (Q1/Q2)
+	 */
+	from_Q = get_quadrant_of_lid(adj_list[link->from].lid);
+	to_Q = get_quadrant_of_lid(adj_list[link->to].lid);
+
+	if (0 == lid_offset) {
+		if ((0 == from_Q || 1 == from_Q) && (0 == to_Q || 1 == to_Q))
+			return FALSE;
+	} else if (1 == lid_offset) {
+		if ((2 == from_Q || 3 == from_Q) && (2 == to_Q || 3 == to_Q))
+			return FALSE;
+	} else if (2 == lid_offset) {
+		if ((0 == from_Q || 3 == from_Q) && (0 == to_Q || 3 == to_Q))
+			return FALSE;
+	} else if (3 == lid_offset) {
+		if ((1 == from_Q || 2 == from_Q) && (1 == to_Q || 2 == to_Q))
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
 /* dijkstra step from one source to all switches in the df-/sssp graph */
 static int dijkstra(osm_ucast_mgr_t * p_mgr, cl_heap_t * p_heap,
 		    vertex_t * adj_list, uint32_t adj_list_size,
-		    osm_port_t * port, uint16_t lid)
+		    osm_port_t * port, uint16_t lid, int8_t lid_offset)
 {
 	uint32_t i = 0, j = 0, index = 0;
 	osm_node_t *remote_node = NULL;
@@ -1481,6 +1542,10 @@ static int dijkstra(osm_ucast_mgr_t * p_mgr, cl_heap_t * p_heap,
 
 		/* add/update nodes which aren't discovered but accessible */
 		for (link = current->links; link != NULL; link = link->next) {
+			/* filter invalid links for parx, but leave HCA<->SW */
+			if (!valid_link_4_parx(adj_list, link, lid_offset)
+			    && adj_list[link->from].sw)
+				continue;
 			if ((adj_list[link->to].state != DISCOVERED)
 			    && (current->distance + link->weight <
 				adj_list[link->to].distance)) {
@@ -2577,11 +2642,11 @@ static int merge_demands_into_switches(const osm_ucast_mgr_t *p_mgr,
 {
 	cl_qmap_t *port_tbl = &p_mgr->p_subn->port_guid_tbl;
 	vertex_t *adj_list = dfsssp_ctx->adj_list;
-	uint32_t i = 0, adj_list_size = dfsssp_ctx->adj_list_size;
+	uint32_t i = 0, j = 0, adj_list_size = dfsssp_ctx->adj_list_size;
 	osm_port_t *port = NULL;
 	cl_map_item_t *item = NULL;
 	osm_node_t *remote_node = NULL;
-	uint8_t remote_port = 0, j = 0;
+	uint8_t remote_port = 0;
 	uint64_t guid = 0;
 	comm_demands_t *p_comm_demands = NULL, *p_sw_comm_demands = NULL;
 	dst_demand_t *p_demand = NULL, *p_demands = NULL;
@@ -2675,7 +2740,7 @@ static int dfsssp_do_dijkstra_routing(void *context)
 	osm_switch_t *sw = NULL;
 	osm_port_t *port = NULL;
 	uint32_t i = 0, err = 0;
-	uint16_t lid = 0, min_lid_ho = 0, max_lid_ho = 0;
+	uint16_t lid = 0, min_lid_ho = 0, max_lid_ho = 0, lid_offset = 0;
 	uint16_t processed_ports = 0, num_job_ports = 0;
 	uint8_t lmc = 0;
 	boolean_t cn_nodes_provided = FALSE, io_nodes_provided = FALSE;
@@ -2885,40 +2950,47 @@ static int dfsssp_do_dijkstra_routing(void *context)
 	   in the subnet (to add the routes to base/enhanced SP0)
 	 */
 	qlist = &p_mgr->port_order_list;
-	processed_ports = 0;
-	for (qlist_item = cl_qlist_head(qlist);
-	     qlist_item != cl_qlist_end(qlist);
-	     qlist_item = cl_qlist_next(qlist_item)) {
-		port = (osm_port_t *)cl_item_obj(qlist_item, port, list_item);
-		processed_ports++;
+	for (lid_offset = 0; lid_offset < (1 << dfsssp_ctx->max_lmc);
+	     lid_offset++) {
+		processed_ports = 0;
+		for (qlist_item = cl_qlist_head(qlist);
+		     qlist_item != cl_qlist_end(qlist);
+		     qlist_item = cl_qlist_next(qlist_item)) {
+			port = (osm_port_t *)cl_item_obj(qlist_item, port,
+							 list_item);
+			processed_ports++;
 
-		/* calculate shortest path with dijkstra from node to all switches/Hca */
-		if (osm_node_get_type(port->p_node) == IB_NODE_TYPE_CA) {
-			OSM_LOG(p_mgr->p_log, OSM_LOG_DEBUG,
-				"Processing Hca with GUID 0x%" PRIx64 "\n",
-				cl_ntoh64(osm_node_get_node_guid
-					  (port->p_node)));
-		} else if (osm_node_get_type(port->p_node) == IB_NODE_TYPE_SWITCH) {
-			OSM_LOG(p_mgr->p_log, OSM_LOG_DEBUG,
-				"Processing switch with GUID 0x%" PRIx64 "\n",
-				cl_ntoh64(osm_node_get_node_guid
-					  (port->p_node)));
-		} else {
-			/* we don't handle routers, in case they show up */
-			continue;
-		}
+			/* calculate shortest path with dijkstra from node to all switches/Hca */
+			if (osm_node_get_type(port->p_node) == IB_NODE_TYPE_CA) {
+				OSM_LOG(p_mgr->p_log, OSM_LOG_DEBUG,
+					"Processing Hca with GUID 0x%" PRIx64 "\n",
+					cl_ntoh64(osm_node_get_node_guid
+						  (port->p_node)));
+			} else if (osm_node_get_type(port->p_node) == IB_NODE_TYPE_SWITCH) {
+				OSM_LOG(p_mgr->p_log, OSM_LOG_DEBUG,
+					"Processing switch with GUID 0x%" PRIx64 "\n",
+					cl_ntoh64(osm_node_get_node_guid
+						  (port->p_node)));
+			} else {
+				/* we don't handle routers, in case they show up */
+				continue;
+			}
 
-		/* distribute the LID range across the ports that can reach those LIDs
-		   to have disjoint paths for one destination port with lmc>0;
-		   for switches with bsp0: min=max; with esp0: max>min if lmc>0
-		 */
-		osm_port_get_lid_range_ho(port, &min_lid_ho,
-					  &max_lid_ho);
-		for (lid = min_lid_ho; lid <= max_lid_ho; lid++) {
+			/* distribute the LID range across the ports that can reach those LIDs
+			   to have disjoint paths for one destination port with lmc>0;
+			   for switches with bsp0: min=max; with esp0: max>min if lmc>0
+			 */
+			osm_port_get_lid_range_ho(port, &min_lid_ho,
+						  &max_lid_ho);
+			lid = min_lid_ho + lid_offset;
+			if (lid > max_lid_ho)
+				continue;
 			/* do dijkstra from this Hca/LID/SP0 to each switch */
 			err =
 			    dijkstra(p_mgr, &heap, adj_list, adj_list_size,
-				     port, lid);
+				     port, lid,
+				     (dfsssp_ctx->do_pattern_aware_routing) ?
+				     lid_offset : -1);
 			if (err)
 				goto ERROR;
 			if (OSM_LOG_IS_ACTIVE_V2(p_mgr->p_log, OSM_LOG_DEBUG))
@@ -3127,7 +3199,7 @@ static ib_api_status_t dfsssp_do_mcast_routing(void * context,
 	 */
 	lid = osm_node_get_base_lid(root_sw->p_node, 0);
 	port = osm_get_port_by_lid(sm->p_subn, lid);
-	err = dijkstra(p_mgr, &heap, adj_list, adj_list_size, port, lid);
+	err = dijkstra(p_mgr, &heap, adj_list, adj_list_size, port, lid, -1);
 	if (err) {
 		OSM_LOG(sm->p_log, OSM_LOG_ERROR, "ERR AD52: "
 			"Dijkstra step for mcast failed for group 0x%X\n",
@@ -3228,6 +3300,7 @@ static dfsssp_context_t *dfsssp_context_create(osm_opensm_t * p_osm,
 		dfsssp_ctx->vl_split_count = NULL;
 		dfsssp_ctx->do_pattern_aware_routing = FALSE;
 		dfsssp_ctx->csv_p = NULL;
+		dfsssp_ctx->max_lmc = 0;
 	} else {
 		OSM_LOG(p_osm->sm.ucast_mgr.p_log, OSM_LOG_ERROR,
 			"ERR AD04: cannot allocate memory for dfsssp_ctx in dfsssp_context_create\n");
